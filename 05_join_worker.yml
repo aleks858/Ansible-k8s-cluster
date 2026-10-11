@@ -1,0 +1,173 @@
+---
+- name: Присоединение worker к кластеру Kubernetes
+  hosts: k8s_workers
+  become: yes
+  gather_facts: yes
+  vars:
+    k8s_version: "1.28.15"
+    join_command: "kubeadm join //ip address :6443 --//token
+  tasks:
+
+    # ============================================
+    # ШАГ 0. МОДУЛИ ЯДРА И SYSCTL
+    # ============================================
+    - name: Загрузить модуль br_netfilter
+      modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: Загрузить модуль overlay
+      modprobe:
+        name: overlay
+        state: present
+
+    - name: Создать /etc/modules-load.d/k8s.conf
+      copy:
+        content: |
+          br_netfilter
+          overlay
+        dest: /etc/modules-load.d/k8s.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Включить sysctl для Kubernetes
+      sysctl:
+        name: "{{ item }}"
+        value: '1'
+        state: present
+        reload: yes
+      loop:
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+        - net.ipv4.ip_forward
+
+    # ============================================
+    # ШАГ 1. ИСПРАВЛЕНИЕ CONTAINERD
+    # ============================================
+    - name: Создать дефолтный конфиг containerd
+      shell: containerd config default | tee /etc/containerd/config.toml > /dev/null
+      changed_when: true
+
+    - name: Включить SystemdCgroup
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: Исправить sandbox_image на pause:3.9
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'sandbox_image = "registry.k8s.io/pause:.*"'
+        replace: 'sandbox_image = "registry.k8s.io/pause:3.9"'
+
+    - name: Перезапустить containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    # ============================================
+    # ШАГ 2. РЕПОЗИТОРИЙ KUBERNETES 1.28
+    # ============================================
+    - name: Создать /etc/apt/keyrings
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Проверить GPG-ключ Kubernetes
+      stat:
+        path: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      register: gpg_key
+
+    - name: Скачать GPG-ключ с master (если нет)
+      fetch:
+        src: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        dest: /tmp/
+        flat: yes
+      delegate_to: k8s_master
+      become: yes
+      when: not gpg_key.stat.exists
+
+    - name: Скопировать GPG-ключ на worker (если нет)
+      copy:
+        src: /tmp/kubernetes-apt-keyring.gpg
+        dest: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+        mode: '0644'
+      when: not gpg_key.stat.exists
+
+    - name: Добавить репозиторий Kubernetes 1.28
+      copy:
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /"
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        mode: '0644'
+
+    - name: Обновить кэш apt
+      apt:
+        update_cache: yes
+
+    # ============================================
+    # ШАГ 3. ПОНИЖЕНИЕ ВЕРСИЙ KUBERNETES
+    # ============================================
+    - name: Понизить kubelet, kubeadm, kubectl до {{ k8s_version }}
+      apt:
+        name:
+          - "kubelet={{ k8s_version }}-1.1"
+          - "kubeadm={{ k8s_version }}-1.1"
+          - "kubectl={{ k8s_version }}-1.1"
+        state: present
+        allow_downgrade: yes
+        allow_change_held_packages: yes
+
+    - name: Зафиксировать версии
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Перезапустить kubelet
+      systemd:
+        name: kubelet
+        state: restarted
+        enabled: yes
+
+    # ============================================
+    # ШАГ 4. ПРИСОЕДИНЕНИЕ К КЛАСТЕРУ
+    # ============================================
+    - name: Проверить, присоединён ли worker
+      stat:
+        path: /etc/kubernetes/kubelet.conf
+      register: kubelet_conf
+
+    - name: Присоединить worker к кластеру
+      command: "{{ join_command }}"
+      when: not kubelet_conf.stat.exists
+      async: 600
+      poll: 30
+
+    - name: Показать результат
+      debug:
+        msg: "Worker присоединён к кластеру"
+      when: not kubelet_conf.stat.exists
+
+    # ============================================
+    # ШАГ 5. ПРОВЕРКА
+    # ============================================
+    - name: Подождать 30 секунд
+      pause:
+        seconds: 30
+
+    - name: Проверить kubelet
+      systemd:
+        name: kubelet
+      register: kubelet_status
+      changed_when: false
+
+    - name: Показать статус kubelet
+      debug:
+        msg: "kubelet: {{ kubelet_status.status.ActiveState }}"

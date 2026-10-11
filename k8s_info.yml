@@ -1,0 +1,21 @@
+---
+- name: Информация о нодах Kubernetes
+  hosts: k8s_cluster
+  gather_facts: yes
+  tasks:
+
+    - name: Показать имя хоста
+      debug:
+        msg: "Хост: {{ ansible_hostname }}"
+
+    - name: Показать IP
+      debug:
+        msg: "IP: {{ ansible_default_ipv4.address }}"
+
+    - name: Показать RAM
+      debug:
+        msg: "RAM: {{ ansible_memtotal_mb }} MB"
+
+    - name: Показать CPU
+      debug:
+        msg: "CPU: {{ ansible_processor_vcpus }} ядер"

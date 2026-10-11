@@ -1,0 +1,46 @@
+---
+- name: Подготовка нод для Kubernetes
+  hosts: k8s_cluster
+  become: yes
+  gather_facts: yes
+  tasks:
+
+    - name: Отключить swap
+      command: swapoff -a
+      changed_when: false
+
+    - name: Убрать swap из /etc/fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#].*?\sswap\s+sw\s+.*)$'
+        replace: '# \1'
+
+    - name: Загрузить модули ядра
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - br_netfilter
+        - overlay
+
+    - name: Настроить sysctl для Kubernetes
+      sysctl:
+        name: "{{ item }}"
+        value: '1'
+        state: present
+        reload: yes
+      loop:
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+        - net.ipv4.ip_forward
+
+    - name: Установить базовые пакеты
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes

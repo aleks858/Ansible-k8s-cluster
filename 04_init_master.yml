@@ -1,0 +1,319 @@
+---
+- name: Инициализация Kubernetes master
+  hosts: k8s_master
+  become: yes
+  gather_facts: yes
+  vars:
+    k8s_version: "1.28.15"
+    k8s_minor: "v1.28"
+  tasks:
+
+    # ============================================
+    # ШАГ 0. МОДУЛИ ЯДРА И SYSCTL
+    # ============================================
+    - name: Загрузить модуль br_netfilter
+      modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: Загрузить модуль overlay
+      modprobe:
+        name: overlay
+        state: present
+
+    - name: Создать /etc/modules-load.d/k8s.conf
+      copy:
+        content: |
+          br_netfilter
+          overlay
+        dest: /etc/modules-load.d/k8s.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Включить sysctl для Kubernetes
+      sysctl:
+        name: "{{ item }}"
+        value: '1'
+        state: present
+        reload: yes
+      loop:
+        - net.bridge.bridge-nf-call-iptables
+        - net.bridge.bridge-nf-call-ip6tables
+        - net.ipv4.ip_forward
+
+    # ============================================
+    # ШАГ 1. ПРОВЕРКА ЯДРА
+    # ============================================
+    - name: Проверить версию ядра
+      command: uname -r
+      register: kernel_version
+      changed_when: false
+
+    - name: Показать версию ядра
+      debug:
+        msg: "Ядро: {{ kernel_version.stdout }}"
+
+    - name: Предупреждение о ядре 7.0
+      debug:
+        msg: "ВНИМАНИЕ: Ядро 7.0 несовместимо с Kubernetes {{ k8s_version }}. Установите ядро 6.8."
+      when: "'7.0' in kernel_version.stdout"
+
+    # ============================================
+    # ШАГ 2. ПРОВЕРКА И ИСПРАВЛЕНИЕ CONTAINERD
+    # ============================================
+    - name: Проверить версию containerd
+      command: containerd --version
+      register: containerd_version
+      changed_when: false
+
+    - name: Показать версию containerd
+      debug:
+        msg: "{{ containerd_version.stdout }}"
+
+    - name: Понизить containerd до 1.7 (если 2.x)
+      apt:
+        name: containerd.io=1.7.29-1~ubuntu.24.04~noble
+        state: present
+        allow_downgrade: yes
+      when: "'v2' in containerd_version.stdout"
+
+    - name: Создать дефолтный конфиг containerd
+      shell: containerd config default | tee /etc/containerd/config.toml > /dev/null
+      changed_when: true
+
+    - name: Включить SystemdCgroup
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        replace: 'SystemdCgroup = true'
+
+    - name: Исправить sandbox_image на pause:3.9
+      replace:
+        path: /etc/containerd/config.toml
+        regexp: 'sandbox_image = "registry.k8s.io/pause:.*"'
+        replace: 'sandbox_image = "registry.k8s.io/pause:3.9"'
+
+    - name: Перезапустить containerd
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+        daemon_reload: yes
+
+    # ============================================
+    # ШАГ 3. ПРОВЕРКА RUNC
+    # ============================================
+    - name: Проверить версию runc
+      command: runc --version
+      register: runc_version
+      changed_when: false
+
+    - name: Показать версию runc
+      debug:
+        msg: "{{ runc_version.stdout }}"
+
+    - name: Понизить runc до 1.1.15 (если 1.3+)
+      shell: |
+        wget -q https://github.com/opencontainers/runc/releases/download/v1.1.15/runc.amd64 -O /tmp/runc.amd64
+        install -m 755 /tmp/runc.amd64 /usr/local/sbin/runc
+        rm -f /tmp/runc.amd64
+      when: "'1.3' in runc_version.stdout or '1.4' in runc_version.stdout or '1.5' in runc_version.stdout"
+
+    - name: Перезапустить containerd после runc
+      systemd:
+        name: containerd
+        state: restarted
+
+    # ============================================
+    # ШАГ 4. ПРОВЕРКА ВЕРСИЙ KUBERNETES
+    # ============================================
+    - name: Проверить версию kubelet
+      command: kubelet --version
+      register: kubelet_version
+      changed_when: false
+
+    - name: Показать версию kubelet
+      debug:
+        msg: "{{ kubelet_version.stdout }}"
+
+    - name: Понизить kubelet, kubeadm, kubectl до {{ k8s_version }}
+      apt:
+        name:
+          - "kubelet={{ k8s_version }}-1.1"
+          - "kubeadm={{ k8s_version }}-1.1"
+          - "kubectl={{ k8s_version }}-1.1"
+        state: present
+        allow_downgrade: yes
+        allow_change_held_packages: yes
+      when: "k8s_version not in kubelet_version.stdout"
+
+    - name: Зафиксировать версии
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    # ============================================
+    # ШАГ 5. СБРОС СТАРОГО КЛАСТЕРА
+    # ============================================
+    - name: Проверить, инициализирован ли кластер
+      stat:
+        path: /etc/kubernetes/admin.conf
+      register: k8s_admin_conf
+
+    - name: Сбросить старый кластер
+      command: kubeadm reset -f
+      when: k8s_admin_conf.stat.exists
+      ignore_errors: yes
+
+    - name: Удалить старые конфиги
+      file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/kubernetes
+        - /var/lib/etcd
+        - /var/lib/kubelet
+        - /etc/cni/net.d
+
+    - name: Удалить .kube
+      file:
+        path: "/home/aleksandr/.kube"
+        state: absent
+
+    - name: Перезапустить containerd и kubelet
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+      loop:
+        - containerd
+        - kubelet
+
+    # ============================================
+    # ШАГ 6. СКАЧАТЬ ОБРАЗЫ
+    # ============================================
+    - name: Скачать образы Kubernetes
+      command: kubeadm config images pull --kubernetes-version v{{ k8s_version }}
+      register: images_pull
+      changed_when: true
+
+    - name: Показать результат
+      debug:
+        msg: "{{ images_pull.stdout_lines }}"
+
+    # ============================================
+    # ШАГ 7. ИНИЦИАЛИЗАЦИЯ КЛАСТЕРА
+    # ============================================
+    - name: Инициализировать кластер
+      command: >
+        kubeadm init
+        --pod-network-cidr=192.168.0.0/16
+        --apiserver-advertise-address={{ ansible_default_ipv4.address }}
+        --kubernetes-version v{{ k8s_version }}
+      register: kubeadm_init
+      async: 600
+      poll: 30
+
+    - name: Показать результат инициализации
+      debug:
+        msg: "{{ kubeadm_init.stdout_lines }}"
+      when: kubeadm_init.stdout_lines is defined
+
+    # ============================================
+    # ШАГ 8. НАСТРОЙКА KUBECTL
+    # ============================================
+    - name: Создать .kube директорию
+      file:
+        path: /home/aleksandr/.kube
+        state: directory
+        owner: aleksandr
+        group: aleksandr
+        mode: '0755'
+
+    - name: Скопировать admin.conf
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/aleksandr/.kube/config
+        remote_src: yes
+        owner: aleksandr
+        group: aleksandr
+        mode: '0644'
+
+    # ============================================
+    # ШАГ 9. СКАЧАТЬ ОБРАЗЫ CALICO
+    # ============================================
+    - name: Скачать calico/cni
+      command: crictl --runtime-endpoint unix:///run/containerd/containerd.sock pull docker.io/calico/cni:v3.27.0
+      changed_when: true
+      ignore_errors: yes
+
+    - name: Скачать calico/node
+      command: crictl --runtime-endpoint unix:///run/containerd/containerd.sock pull docker.io/calico/node:v3.27.0
+      changed_when: true
+      ignore_errors: yes
+
+    - name: Скачать calico/kube-controllers
+      command: crictl --runtime-endpoint unix:///run/containerd/containerd.sock pull docker.io/calico/kube-controllers:v3.27.0
+      changed_when: true
+      ignore_errors: yes
+
+    # ============================================
+    # ШАГ 10. УСТАНОВИТЬ CALICO
+    # ============================================
+    - name: Установить Calico
+      command: kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml
+      environment:
+        KUBECONFIG: /home/aleksandr/.kube/config
+      changed_when: true
+
+    # ============================================
+    # ШАГ 11. ПОЛУЧЕНИЕ JOIN-КОМАНДЫ
+    # ============================================
+    - name: Получить команду join
+      command: kubeadm token create --print-join-command
+      register: join_command
+      changed_when: false
+
+    - name: Сохранить join-команду локально
+      copy:
+        content: "{{ join_command.stdout }}"
+        dest: "./join_command.txt"
+      delegate_to: localhost
+      become: no
+
+    - name: Показать join-команду
+      debug:
+        msg: "{{ join_command.stdout }}"
+
+    # ============================================
+    # ШАГ 12. ПРОВЕРКА
+    # ============================================
+    - name: Подождать 60 секунд
+      pause:
+        seconds: 60
+
+    - name: Проверить ноды
+      command: kubectl get nodes
+      environment:
+        KUBECONFIG: /home/aleksandr/.kube/config
+      register: nodes
+      changed_when: false
+
+    - name: Показать ноды
+      debug:
+        msg: "{{ nodes.stdout_lines }}"
+
+    - name: Проверить поды
+      command: kubectl get pods -n kube-system
+      environment:
+        KUBECONFIG: /home/aleksandr/.kube/config
+      register: pods
+      changed_when: false
+
+    - name: Показать поды
+      debug:
+        msg: "{{ pods.stdout_lines }}"

@@ -1,0 +1,41 @@
+---
+- name: Установка Docker на все ноды
+  hosts: k8s_cluster
+  become: yes
+  gather_facts: yes
+  tasks:
+
+    - name: Добавить GPG-ключ Docker
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Добавить репозиторий Docker
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu noble stable"
+        state: present
+        update_cache: yes
+
+    - name: Установить Docker
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+        state: present
+        update_cache: yes
+
+    - name: Запустить Docker
+      systemd:
+        name: docker
+        state: started
+        enabled: yes
+
+    - name: Проверить версию Docker
+      command: docker --version
+      register: docker_version
+      changed_when: false
+
+    - name: Показать версию
+      debug:
+        msg: "{{ docker_version.stdout }}"
